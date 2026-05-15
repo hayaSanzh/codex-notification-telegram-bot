@@ -1,0 +1,18 @@
+[Unit]
+Description=Codex Telegram Notification Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/sanzh/Documents/Projects/codex-notification-bot
+ExecStart=/home/sanzh/Documents/Projects/codex-notification-bot/scripts/start-systemd.sh
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
