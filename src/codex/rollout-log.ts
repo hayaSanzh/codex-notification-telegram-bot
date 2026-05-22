@@ -285,10 +285,26 @@ function parseRolloutEvents(text: string): RolloutEvent[] {
 
     const message = parseAgentMessageEvent(record, currentTurnId, timestamp);
     if (message) {
-      events.push(message);
+      pushMessageEvent(events, message);
     }
   }
   return events;
+}
+
+function pushMessageEvent(events: RolloutEvent[], message: AgentMessageEvent): void {
+  const previous = events.at(-1);
+  if (
+    previous &&
+    (previous.kind === "commentary" || previous.kind === "final") &&
+    previous.kind === message.kind &&
+    previous.turnId === message.turnId &&
+    previous.text === message.text &&
+    Math.abs(previous.timestamp - message.timestamp) < 1000
+  ) {
+    return;
+  }
+
+  events.push(message);
 }
 
 function parseAgentMessageEvent(

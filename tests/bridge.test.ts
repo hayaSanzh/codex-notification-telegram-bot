@@ -39,13 +39,25 @@ class MockNotifier implements BridgeNotifier {
   approvals: Array<{ chatId: ChatId; text: string; token: string }> = [];
   photos: Array<{ chatId: ChatId; path: string; caption?: string }> = [];
   documents: Array<{ chatId: ChatId; path: string; caption?: string }> = [];
+  failNextSendText?: Error;
+  failNextUpdateText?: Error;
 
   async sendText(chatId: ChatId, text: string): Promise<number> {
+    if (this.failNextSendText) {
+      const error = this.failNextSendText;
+      this.failNextSendText = undefined;
+      throw error;
+    }
     this.texts.push({ chatId, text });
     return this.texts.length;
   }
 
   async updateText(chatId: ChatId, messageId: number, text: string): Promise<void> {
+    if (this.failNextUpdateText) {
+      const error = this.failNextUpdateText;
+      this.failNextUpdateText = undefined;
+      throw error;
+    }
     this.updates.push({ chatId, messageId, text });
   }
 
@@ -600,6 +612,182 @@ describe("CodexBridge", () => {
     await vi.waitFor(() => {
       expect(notifier.texts.some((message) => message.text.includes("external progress"))).toBe(true);
       expect(notifier.texts.at(-1)?.text).toContain("external final");
+    });
+    vi.useRealTimers();
+  });
+
+  it("deduplicates paired rollout commentary records", async () => {
+    vi.useFakeTimers();
+    bridge = new CodexBridge({
+      rpc: rpc as never,
+      state,
+      notifier,
+      logger: new Logger("error"),
+      threadListLimit: 10,
+      streamUpdatesMs: 100,
+      streamMinChars: 5,
+    });
+    await bridge.start();
+
+    const rolloutPath = join(dir, "rollout-thread-1.jsonl");
+    const started = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "rollout-turn", started_at: Math.floor(Date.now() / 1000) },
+    });
+    await writeFile(rolloutPath, `${started}\n`);
+    const rolloutThread = { ...thread, path: rolloutPath };
+    rpc.responses.set("thread/list", { data: [rolloutThread], nextCursor: null, backwardsCursor: null });
+    rpc.responses.set("thread/resume", { thread: { ...rolloutThread, status: { type: "idle" } }, model: "gpt", modelProvider: "openai", serviceTier: null, cwd: thread.cwd });
+
+    await bridge.listThreads("42");
+    await bridge.selectThread("42", "1", 100);
+    await writeFile(
+      rolloutPath,
+      [
+        started,
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: "event_msg",
+          payload: { type: "agent_message", message: "paired progress", phase: "commentary" },
+        }),
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            phase: "commentary",
+            content: [{ type: "output_text", text: "paired progress" }],
+          },
+        }),
+        "",
+      ].join("\n"),
+    );
+
+    await vi.advanceTimersByTimeAsync(150);
+
+    await vi.waitFor(() => {
+      const previews = [
+        ...notifier.texts.map((message) => message.text),
+        ...notifier.updates.map((message) => message.text),
+      ].filter((message) => message.includes("Промежуточно"));
+      const latestPreview = previews.at(-1) ?? "";
+      expect(latestPreview.match(/paired progress/g)).toHaveLength(1);
+    });
+    vi.useRealTimers();
+  });
+
+  it("treats cumulative rollout commentary as a replacement", async () => {
+    vi.useFakeTimers();
+    bridge = new CodexBridge({
+      rpc: rpc as never,
+      state,
+      notifier,
+      logger: new Logger("error"),
+      threadListLimit: 10,
+      streamUpdatesMs: 100,
+      streamMinChars: 5,
+    });
+    await bridge.start();
+
+    const rolloutPath = join(dir, "rollout-thread-1.jsonl");
+    const started = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "rollout-turn", started_at: Math.floor(Date.now() / 1000) },
+    });
+    await writeFile(rolloutPath, `${started}\n`);
+    const rolloutThread = { ...thread, path: rolloutPath };
+    rpc.responses.set("thread/list", { data: [rolloutThread], nextCursor: null, backwardsCursor: null });
+    rpc.responses.set("thread/resume", { thread: { ...rolloutThread, status: { type: "idle" } }, model: "gpt", modelProvider: "openai", serviceTier: null, cwd: thread.cwd });
+
+    await bridge.listThreads("42");
+    await bridge.selectThread("42", "1", 100);
+    await writeFile(
+      rolloutPath,
+      [
+        started,
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: "event_msg",
+          payload: { type: "agent_message", message: "first progress", phase: "commentary" },
+        }),
+        JSON.stringify({
+          timestamp: new Date(Date.now() + 1).toISOString(),
+          type: "event_msg",
+          payload: { type: "agent_message", message: "first progress\n\nsecond progress", phase: "commentary" },
+        }),
+        "",
+      ].join("\n"),
+    );
+
+    await vi.advanceTimersByTimeAsync(150);
+
+    await vi.waitFor(() => {
+      const previews = [
+        ...notifier.texts.map((message) => message.text),
+        ...notifier.updates.map((message) => message.text),
+      ].filter((message) => message.includes("Промежуточно"));
+      const latestPreview = previews.at(-1) ?? "";
+      expect(latestPreview.match(/first progress/g)).toHaveLength(1);
+      expect(latestPreview).toContain("second progress");
+    });
+    vi.useRealTimers();
+  });
+
+  it("retries an external rollout final when Telegram send fails", async () => {
+    vi.useFakeTimers();
+    bridge = new CodexBridge({
+      rpc: rpc as never,
+      state,
+      notifier,
+      logger: new Logger("error"),
+      threadListLimit: 10,
+      streamUpdatesMs: 100,
+      streamMinChars: 5,
+    });
+    await bridge.start();
+
+    const rolloutPath = join(dir, "rollout-thread-1.jsonl");
+    const started = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "rollout-turn", started_at: Math.floor(Date.now() / 1000) },
+    });
+    await writeFile(rolloutPath, `${started}\n`);
+    const rolloutThread = { ...thread, path: rolloutPath };
+    rpc.responses.set("thread/list", { data: [rolloutThread], nextCursor: null, backwardsCursor: null });
+    rpc.responses.set("thread/resume", { thread: { ...rolloutThread, status: { type: "idle" } }, model: "gpt", modelProvider: "openai", serviceTier: null, cwd: thread.cwd });
+
+    await bridge.listThreads("42");
+    await bridge.selectThread("42", "1", 100);
+    await writeFile(
+      rolloutPath,
+      [
+        started,
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: "event_msg",
+          payload: { type: "agent_message", message: "retry final", phase: "final_answer" },
+        }),
+        "",
+      ].join("\n"),
+    );
+
+    notifier.failNextSendText = new Error("temporary Telegram outage");
+    await vi.advanceTimersByTimeAsync(150);
+
+    expect(notifier.texts.some((message) => message.text.includes("retry final"))).toBe(false);
+    expect(state.getActiveTurn("42")?.turnId).toBe("rollout-turn");
+    expect(state.getSelectedThread("42")?.status).toBe("active");
+
+    await vi.advanceTimersByTimeAsync(150);
+
+    await vi.waitFor(() => {
+      expect(notifier.texts.at(-1)?.text).toContain("retry final");
+      expect(state.getActiveTurn("42")).toBeUndefined();
+      expect(state.getSelectedThread("42")?.status).toBe("idle");
     });
     vi.useRealTimers();
   });

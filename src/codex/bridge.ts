@@ -488,14 +488,15 @@ export class CodexBridge {
     }
 
     const result = await readNewRolloutEvents(path, watched.offset);
-    watched.offset = result.nextOffset;
     const final = [...result.events].reverse().find(isFinalRolloutEvent);
     if (!final) {
+      watched.offset = result.nextOffset;
       return;
     }
 
     const message = ["Codex завершил внешний VS Code turn.", `thread: ${selected.id}`, "", final.text].join("\n");
     await this.options.notifier.sendText(chatId, message);
+    watched.offset = result.nextOffset;
     await this.sendReferencedPaths(chatId, extractExistingLocalPaths(message));
     await this.options.state.setSelectedThreadStatus(userId, selected.id, "idle");
   }
@@ -794,6 +795,16 @@ export class CodexBridge {
       return true;
     }
 
+    if (active.rolloutPath) {
+      const rolloutStatus = await this.pollRollout(active);
+      if (!this.activeTurns.has(active.threadId)) {
+        return false;
+      }
+      if (rolloutStatus === "failed") {
+        return true;
+      }
+    }
+
     this.clearTrackedActive(active);
     await this.options.state.clearActiveTurn(userId);
     await this.options.state.setSelectedThreadStatus(userId, active.threadId, "idle");
@@ -899,15 +910,14 @@ export class CodexBridge {
     active.rolloutTimer.unref();
   }
 
-  private async pollRollout(active: ActiveTurn): Promise<void> {
+  private async pollRollout(active: ActiveTurn): Promise<"active" | "idle" | "failed"> {
     if (!active.rolloutPath || active.rolloutPolling) {
-      return;
+      return "active";
     }
 
     active.rolloutPolling = true;
     try {
       const result = await readNewRolloutEvents(active.rolloutPath, active.rolloutOffset ?? 0);
-      active.rolloutOffset = result.nextOffset;
       for (const event of result.events) {
         if (event.kind === "taskStarted") {
           if (event.turnId !== active.turnId && active.origin === "external") {
@@ -922,8 +932,9 @@ export class CodexBridge {
               active,
               `(VS Code завершил turn со статусом ${event.status}, но final_answer в rollout-файле не найден.)`,
               event.status,
+              result.nextOffset,
             );
-            break;
+            return "idle";
           }
           continue;
         }
@@ -933,19 +944,31 @@ export class CodexBridge {
         }
 
         if (event.kind === "commentary") {
-          active.agentText = active.agentText ? `${active.agentText}\n\n${event.text}` : event.text;
-          await this.flushStream(active, true);
+          const nextAgentText = mergeRolloutCommentary(active.agentText, event.text);
+          if (nextAgentText !== active.agentText) {
+            const previousAgentText = active.agentText;
+            active.agentText = nextAgentText;
+            try {
+              await this.flushStream(active, true);
+            } catch (error) {
+              active.agentText = previousAgentText;
+              throw error;
+            }
+          }
         } else {
-          await this.completeExternalRollout(active, event.text);
-          break;
+          await this.completeExternalRollout(active, event.text, "completed", result.nextOffset);
+          return "idle";
         }
       }
+      active.rolloutOffset = result.nextOffset;
+      return "active";
     } catch (error) {
       this.options.logger.warn("Failed to poll rollout file", {
         threadId: active.threadId,
         rolloutPath: active.rolloutPath,
         error: String(error),
       });
+      return "failed";
     } finally {
       active.rolloutPolling = false;
     }
@@ -968,18 +991,9 @@ export class CodexBridge {
     active: ActiveTurn,
     finalText: string,
     status: "completed" | "failed" | "cancelled" | "interrupted" = "completed",
+    rolloutOffset?: number,
   ): Promise<void> {
-    this.clearTrackedActive(active);
-    await this.options.state.clearActiveTurn(active.userId);
-    await this.options.state.setSelectedThreadStatus(active.userId, active.threadId, "idle");
     const seconds = Math.round((Date.now() - active.startedAt) / 1000);
-    if (active.rolloutPath && active.rolloutOffset !== undefined) {
-      this.idleRolloutOffsets.set(this.idleRolloutKey(String(active.chatId), active.threadId), {
-        path: active.rolloutPath,
-        offset: active.rolloutOffset,
-      });
-    }
-
     const message = [
       `Codex завершил внешний turn: ${status}`,
       `thread: ${active.threadId}`,
@@ -989,6 +1003,19 @@ export class CodexBridge {
       finalText,
     ].join("\n");
     await this.options.notifier.sendText(active.chatId, message);
+
+    const completedOffset = rolloutOffset ?? active.rolloutOffset;
+    if (active.rolloutPath && completedOffset !== undefined) {
+      active.rolloutOffset = completedOffset;
+      this.idleRolloutOffsets.set(this.idleRolloutKey(String(active.chatId), active.threadId), {
+        path: active.rolloutPath,
+        offset: completedOffset,
+      });
+    }
+
+    this.clearTrackedActive(active);
+    await this.options.state.clearActiveTurn(active.userId);
+    await this.options.state.setSelectedThreadStatus(active.userId, active.threadId, "idle");
     await this.sendReferencedPaths(active.chatId, extractExistingLocalPaths(message));
   }
 
@@ -1150,6 +1177,24 @@ function normalizeStartedAt(startedAt: number | null): number {
     return Date.now();
   }
   return startedAt < 10_000_000_000 ? startedAt * 1000 : startedAt;
+}
+
+function mergeRolloutCommentary(current: string, next: string): string {
+  const currentText = current.trim();
+  const nextText = next.trim();
+  if (!nextText) {
+    return current;
+  }
+  if (!currentText) {
+    return nextText;
+  }
+  if (currentText === nextText || currentText.endsWith(`\n\n${nextText}`)) {
+    return current;
+  }
+  if (nextText.startsWith(currentText)) {
+    return nextText;
+  }
+  return `${currentText}\n\n${nextText}`;
 }
 
 function isFinalRolloutEvent(event: RolloutEvent): event is RolloutEvent & { kind: "final"; text: string } {
